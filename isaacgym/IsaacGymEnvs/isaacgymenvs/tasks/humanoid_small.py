@@ -66,16 +66,16 @@ class HumanoidSmall(VecTask):
 
         self.max_episode_length = self.cfg["env"]["episodeLength"]
 
-        self.cfg["env"]["numObservations"] = 73#68
+        self.cfg["env"]["numObservations"] = 77#68
         # Actions:
         # 0-3 : left leg
         # 4-7 : right leg
 
-        self.cfg["env"]["numActions"] = 8
+        self.cfg["env"]["numActions"] = 12
 
-        self.period_t_ = 450           # Duration of one walking step (in milliseconds)
-        self.T_DSP_ = 0.1              # Double Support Phase ratio (portion of step with both feet on ground)
-        self.step_length_ = 6          # Step length (in centimeters)
+        self.period_t_ = 390           # Duration of one walking step (in milliseconds)
+        self.T_DSP_ = 0.0              # Double Support Phase ratio (portion of step with both feet on ground)
+        self.step_length_ = 8          # Step length (in centimeters)
         self.lift_height_ = 6          # Foot lift height during swing phase (in centimeters)
 
 
@@ -331,19 +331,25 @@ class HumanoidSmall(VecTask):
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.pos_action))
         
     def calculate_pos(self, pos):
-        x_range = [-0.2, 0.2]  # 前後擺動範圍(m)
-        y_range = [-0.045, 0.045]  # 左右擺動範圍(m)
-        z_range = [0.15, 0.235]   # 上下擺動範圍 (抬腳)(m)
-        # tha_range = [-0.0034906585, 0.0034906585] # 旋轉範圍(rad)
-        tha_range = [-0.0, 0.0] # 旋轉範圍
-        ranges = [x_range, y_range, z_range, tha_range, 
-          x_range, y_range, z_range, tha_range]
-        foot_pos = torch.empty_like(pos, device=self.device)
-        for i in range(pos.shape[1]):  # 遍歷每個維度
-            min_val, max_val = ranges[i]
-            foot_pos[:, i] = torch.lerp(torch.tensor(min_val, device=self.device), 
-                                        torch.tensor(max_val, device=self.device), 
-                                        (pos[:, i] + 1) / 2)
+        # 定義每個維度對應的最小值與最大值
+
+        min_vals = torch.tensor([
+            -0.2, -0.045, 0.15, -0.0349,   # 左腳: x, y, z, theta
+            -0.2, -0.045, 0.15, -0.0349,    # 右腳: x, y, z, theta
+            -0.34906585, 0, 
+            -0.34906585, -0.17453293       
+        ], device=self.device)
+
+        max_vals = torch.tensor([
+            0.2, 0.045, 0.235, 0.0349,
+            0.2, 0.045, 0.235, 0.0349,
+            0.34906585,0.17453293,
+            0.34906585,0
+        ], device=self.device)
+
+        # 將 [-1, 1] 映射到 [min_val, max_val]
+        foot_pos = (pos + 1) / 2 * (max_vals - min_vals) + min_vals
+        # 換成公分
         self.foot_pos = foot_pos * 100
 
     def pre_physics_step(self, actions):
@@ -353,6 +359,8 @@ class HumanoidSmall(VecTask):
         self.ik.ik(self.foot_pos[:, 0:4], self.foot_pos[:, 4:8])
 
         self.pos_action[:,0:22] = torch.tensor(self.ik.Thta, dtype=torch.float32, device=self.device)
+        self.pos_action[:,0:2] = self.foot_pos[:, 8:10]  /100
+        self.pos_action[:,4:6] = self.foot_pos[:, 10:12]  /100
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.pos_action))
 
     def post_physics_step(self):
@@ -553,7 +561,7 @@ def compute_humanoid_reward_v2(
     reset_buf,
     progress_buf,
     foot_end_point,
-    com_target,
+    foot_pos,
     robot_state,
     switch_foot,
     potentials,
@@ -581,13 +589,12 @@ def compute_humanoid_reward_v2(
     right_is_supporting = 1.0 - right_is_swinging
     robot_height = obs_buf[:, 0]
     robot_roll = obs_buf[:, 8]
-
     #機器人高度penalty
     print("robot_height",robot_height)
     print("robot_roll",robot_roll)
     height_penalty = torch.where(torch.abs(robot_height-0.265)>0.005, -1.0, 0.0)
-    robot_roll_penalty = torch.where(robot_roll < 0.05, -1.0, 0.3) * left_is_supporting + torch.where(robot_roll > -0.05, -1.0, 0.3) * right_is_supporting
-    # robot_roll_penalty = 0
+    robot_roll_penalty = torch.where(robot_roll > 0.02, -0.3, 0.1) * left_is_supporting + torch.where(robot_roll < -0.02, -0.3, 0.1) * right_is_supporting
+    print("robot_roll_penalty",robot_roll_penalty)
     # 機器人座標系中的左右腳目標位置
     left_target_x = robot_state[:, 4]/ 100
     right_target_x = robot_state[:, 8]/ 100
@@ -620,6 +627,16 @@ def compute_humanoid_reward_v2(
     left_z_actual = foot_end_point[:, 2]
     right_z_expected = robot_state[:, 10]/100 + 0.035
     right_z_actual = foot_end_point[:, 5]
+    # === hand swing reward（高度誤差）===
+    # 計算 error
+    left_error = torch.abs((foot_pos[:, 8]  /100) - 0.34906585) * left_is_supporting + torch.abs((foot_pos[:, 8]  /100) + 0.34906585) * right_is_supporting
+    right_error = torch.abs((foot_pos[:, 10]  /100) + 0.34906585) * right_is_supporting + torch.abs((foot_pos[:, 10]  /100) - 0.34906585) * left_is_supporting
+
+    # 根據支撐腳計算 reward，支撐腳對應擺動手
+    left_reward = (1 - torch.tanh(3.0 * left_error))
+    right_reward = (1 - torch.tanh(3.0 * right_error))
+
+    hand_swing_reward = left_reward + right_reward
 
     left_z_error = torch.abs(left_z_expected - left_z_actual) * right_is_supporting
     right_z_error = torch.abs(right_z_expected - right_z_actual) * left_is_supporting
@@ -633,20 +650,21 @@ def compute_humanoid_reward_v2(
     yaw_penalty = torch.abs(obs_buf[:, 6])>0.17453293
     step_switch_reward = switch_foot.squeeze(-1).float()
     progress_reward = potentials - prev_potentials
-    alive_reward = torch.ones_like(heading_reward) * 0.2
+    alive_reward = torch.ones_like(heading_reward) * 0.1
 
     # === Reward 合併 ===
     total_reward = (
         0.2 * heading_reward +
         0.2 * up_reward +
-        0.2 * com_reward +
+        0.0 * com_reward +
         0.15 * foot_tracking_x_penalty +
         0.15 * foot_tracking_y_penalty +
         0.3 * foot_lift_reward +
         0.5 * step_switch_reward +
-        0.5   * progress_reward +
+        0.5 * progress_reward +
         0.3 * height_penalty +
-        0.3 * robot_roll_penalty +
+        0.5 * robot_roll_penalty +
+        0.3 * hand_swing_reward +
         alive_reward
     )
     # === 懲罰與重置條件 ===
@@ -656,16 +674,23 @@ def compute_humanoid_reward_v2(
     total_reward = torch.where(y_error, torch.ones_like(total_reward) * death_cost, total_reward)
     total_reward = torch.where(yaw_penalty, torch.ones_like(total_reward) * death_cost, total_reward)
     reset = torch.where(obs_buf[:, 0] < termination_height, torch.ones_like(reset_buf), reset_buf)
+    # print("termination_height",reset[0])
     reset = torch.where(fallen, torch.ones_like(reset_buf), reset)
-    reset = torch.where(obs_buf[:, 64] > 0.03, torch.ones_like(reset_buf), torch.where(obs_buf[:,64]<-0.03,torch.ones_like(reset_buf),reset))
-    reset = torch.where(foot_x_error[:] > 7, torch.ones_like(reset_buf), reset)
+    # print("fallen",reset[0])
+    # print("obs_buf[:, 64]",obs_buf[0, 68])
+    reset = torch.where(obs_buf[:, 68] > 0.03, torch.ones_like(reset_buf), torch.where(obs_buf[:,68]<-0.03,torch.ones_like(reset_buf),reset))
+    # print("aa",reset[0])
+    reset = torch.where(foot_x_error[:] > 10, torch.ones_like(reset_buf), reset)
+    # print("foot_x_error",reset[0])
     reset = torch.where(y_error, torch.ones_like(reset_buf), reset)
+    # print("y_error",reset[0])
     reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
     # === Debug print ===
     print("==== Debug Reward ====")
     print(f"heading: {heading_reward[0]:.3f}, up: {up_reward[0]:.3f}, com: {com_reward[0]:.3f}")
     print(f"foot_track: {foot_tracking_x_penalty[0]:.3f}, lift: {foot_lift_reward[0]:.3f}, step: {step_switch_reward[0]:.3f}")
     print(f"foot_error: {foot_y_error[0]:.3f}")
+    print(f"hand_swing_reward: {hand_swing_reward[0]:.3f}")
     print(f"progress: {progress_reward[0]:.3f}")
     print(f"total: {total_reward[0]:.3f}")
     print("======================")
@@ -806,4 +831,3 @@ def compute_humanoid_observations_v2(
     obs = torch.cat([obs, extra_obs], dim=-1)  # 加上 5 維 → 73 維
 
     return obs, potentials, prev_potentials_new, up_vec, heading_vec, foot_end_point, com_target
-
