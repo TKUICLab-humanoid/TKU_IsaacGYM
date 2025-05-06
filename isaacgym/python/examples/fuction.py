@@ -22,8 +22,8 @@ class WalkingGaitByLIPM:
         self.Tc_ = np.sqrt(27/9.8)/10
         self.TT_ = period_t_ * 0.001
         # print("Tc",self.Tc_,"TT",self.TT_)
-        self.step_length_ = 2
-        self.shift_length_ = 0
+        self.step_length_ = 3
+        self.shift_length_ = -1
         self.init()
         self.a = []
         self.b = []
@@ -31,6 +31,7 @@ class WalkingGaitByLIPM:
         self.d = []
         self.e = []
         self.f = []
+        self.form = 180/np.pi
 
     def init(self):
         self.walking_state = 0 # StopStep:0 ,StartStep:1 ,FirstStep:2 ,Repeat:3
@@ -104,7 +105,7 @@ class WalkingGaitByLIPM:
             
             if self.walking_state == 1:
                 self.theta_ = 0
-                self.theta[0] = 0
+                self.theta[0] = 1 /self.form
 
                 self.now_width_ = 2 * self.width_size_ * (-pow(-1, self.now_step_ + 1))
                 self.width_x = -np.sin(self.theta_) * self.now_width_
@@ -197,11 +198,30 @@ class WalkingGaitByLIPM:
         rpz_ = self.wFootPositionZ(self.lift_height_, self.t_, self.TT_, self.T_DSP_) if odd_step else 0
         
         # Foot rotation adjustments
-        if walking_state in [0, 2, 3]:
-            if self.theta[0] * self.theta[1] >= 0 or walking_state != 3:
-                lpt_, rpt_ = self.wFootTheta(-self.theta[1], 1, self.t_, self.TT_, self.T_DSP_), \
-                            self.wFootTheta(-self.theta[0], 0, self.t_, self.TT_, self.T_DSP_)
-        
+        if walking_state == 1:  # FirstStep
+            lpt_ = self.wFootTheta(self.theta[1], 1, self.t_, self.TT_, self.T_DSP_)
+            rpt_ = self.wFootTheta(self.theta[0], 0, self.t_, self.TT_, self.T_DSP_)
+        elif walking_state == 4:  # StopStep
+            if odd_step:
+                lpt_, rpt_ = 0, self.wFootTheta(self.theta[1], 1, self.t_, self.TT_, self.T_DSP_)
+            else:
+                lpt_, rpt_ = self.wFootTheta(self.theta[1], 1, self.t_, self.TT_, self.T_DSP_), 0
+        elif walking_state in [0, 2, 3]:  # StartStep / Repeat
+            if walking_state in [0, 2, 3]:
+                if self.theta[0] * self.theta[1] >= 0 and not odd_step:
+                    lpt_ = self.wFootTheta(self.theta[1], 1, self.t_, self.TT_, self.T_DSP_)  # <---注意 reverse=0
+                    rpt_ = self.wFootTheta(self.theta[0], 0, self.t_, self.TT_, self.T_DSP_)  # <---注意 reverse=1
+                elif self.theta[0] * self.theta[1] >= 0:
+                    lpt_ = self.wFootTheta(self.theta[0], 0, self.t_, self.TT_, self.T_DSP_)
+                    rpt_ = self.wFootTheta(self.theta[1], 1, self.t_, self.TT_, self.T_DSP_)
+                else:
+                    lpt_, rpt_ = 0, 0
+        # print("px",px_, "py",py_)
+        print("===========================")
+        print("lpx",lpx_,"lpy",lpy_,"lpz",lpz_,"lpt",lpt_)
+        print("rpx",rpx_,"rpy",rpy_,"rpz",rpz_,"rpt",rpt_)
+        print("self.now_y_[0]",self.now_y_[0])
+        print("-----------------------------")
         return vx0_, vy0_, px_, py_, lpx_, lpy_, rpx_, rpy_, lpz_, rpz_, lpt_, rpt_
         
     def coordinate_transformation(self,py_u, px_u, lpx_, lpy_, rpx_, rpy_, lpz_, rpz_, lpt_, rpt_):
@@ -232,8 +252,8 @@ class WalkingGaitByLIPM:
         end_point_rz_ = step_point_rz_ - (self.pz_ - self.Length_Leg)
         end_point_lthta_ = step_point_lthta_
         end_point_rthta_ = step_point_rthta_
-        # print("end_point_rx_",end_point_rx_, "end_point_ry_",end_point_ry_, "end_point_rz_",end_point_rz_, "end_point_lx_",end_point_lx_, "end_point_ly_",end_point_ly_, "end_point_lz_",end_point_lz_, "end_point_rthta_",end_point_rthta_, "end_point_lthta_",end_point_lthta_)
-        # print(step_point_ry_-step_point_ly_)
+        print("end_point_rx_",end_point_rx_, "end_point_ry_",end_point_ry_, "end_point_rz_",end_point_rz_, "end_point_lx_",end_point_lx_, "end_point_ly_",end_point_ly_, "end_point_lz_",end_point_lz_, "end_point_rthta_",end_point_rthta_, "end_point_lthta_",end_point_lthta_)
+        print("robot_waist",step_point_ry_-step_point_ly_)
         self.a.append(self.now_x_[1]/100)
         self.b.append(step_point_ry_)
         self.c.append(end_point_ry_)
@@ -286,16 +306,18 @@ class WalkingGaitByLIPM:
         new_T = T * (1 - T_DSP)
         new_t = t - T * T_DSP / 2
         omega = 2 * np.pi / new_T
-        
+
         if t > 0 and t <= T * T_DSP / 2:
-            return theta if reverse else 0
+            return 0 
         elif T * T_DSP / 2 < t <= T * (1 - T_DSP / 2):
-            if reverse:
-                return 0.5 * theta * (1 - np.cos(0.5 * omega * (new_t - new_T)))
-            else:
+            if not reverse:
                 return 0.5 * theta * (1 - np.cos(0.5 * omega * new_t))
+            else:
+                return 0.5 * theta * (1 - np.cos(0.5 * omega * (new_t - new_T)))
         else:
             return 0 if reverse else theta
+
+
         
 class InverseKinematic:
     def __init__(self):
@@ -333,7 +355,7 @@ class InverseKinematic:
         # print("l1",self.l1, 'l2',self.l2, 'RX_2',self.RX_2, 'RY_2',self.RY_2, 'RZ_2', self.RZ_2, 'LX_2',self.LX_2)
         # print("LY_2",self.LY_2, 'LZ_2',self.LZ_2, 'l1_2',self.l1_2, 'l2_2',self.l2_2, 'l1_l2',self.l1_l2, 'R_Lyz',self.R_Lyz, 'L_Lyz',self.L_Lyz)
         # print("R_Lxyz",self.R_Lxyz, 'L_Lxyz',self.L_Lxyz, 'RL_2',self.RL_2, 'LL_2',self.LL_2)
-        self.Thta[10] = 0#end_point_lthta_ + 0
+        self.Thta[10] = end_point_lthta_ + 0
         if end_point_ly_ == 0:
             self.Thta[11] = 0
         else:
@@ -351,7 +373,7 @@ class InverseKinematic:
 
         self.Thta[15] = -self.Thta[11]
 
-        self.Thta[16] = 0#end_point_rthta_ + 0
+        self.Thta[16] = end_point_rthta_ + 0
 
         if end_point_ry_ == 0:
             self.Thta[17] = 0
@@ -372,8 +394,8 @@ class InverseKinematic:
 
         self.Thta[12] = -self.Thta[12]
         self.Thta[13] = -self.Thta[13]
-        # print("LF",self.Thta[10:16])
-        # print("RF",self.Thta[16:22])
+        print("LF",self.Thta[10:16])
+        print("RF",self.Thta[16:22])
         # self.a.append(self.Thta[11])
         # self.b.append(self.Thta[17])
         

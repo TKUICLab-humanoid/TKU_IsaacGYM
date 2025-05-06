@@ -73,7 +73,7 @@ class HumanoidSmall(VecTask):
 
         self.cfg["env"]["numActions"] = 12
 
-        self.period_t_ = 390           # Duration of one walking step (in milliseconds)
+        self.period_t_ = 300           # Duration of one walking step (in milliseconds)
         self.T_DSP_ = 0.0              # Double Support Phase ratio (portion of step with both feet on ground)
         self.step_length_ = 8          # Step length (in centimeters)
         self.lift_height_ = 6          # Foot lift height during swing phase (in centimeters)
@@ -137,6 +137,9 @@ class HumanoidSmall(VecTask):
         self.foot_pos = torch.zeros((self.num_envs, 8), device=self.device)  # 8 表示 [x, y, z, theta] * 2
         self.com_target = to_torch([0, 0, 0, 0], device=self.device).repeat((self.num_envs, 1))
         self.support_foot = torch.zeros((self.num_envs, 2), device=self.device)
+        self.walkdata_x = torch.zeros((self.num_envs, 1), device=self.device)
+        self.walkdata_y = torch.zeros((self.num_envs, 1), device=self.device)
+        self.walkdata_theta = torch.zeros((self.num_envs, 1), device=self.device)
 
     def create_sim(self):
         self.up_axis_idx = 2 # index of up axis: Y=1, Z=2
@@ -201,7 +204,7 @@ class HumanoidSmall(VecTask):
         self.num_joints = self.gym.get_asset_joint_count(humanoid_asset)
 
         start_pose = gymapi.Transform()
-        start_pose.p = gymapi.Vec3(*get_axis_params(0.24, self.up_axis_idx))
+        start_pose.p = gymapi.Vec3(*get_axis_params(0.235, self.up_axis_idx))
         start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), -0.5 * math.pi) #gymapi.Quat(0.0, 0.0, 0.0, 1.0)
 
         self.start_rotation = torch.tensor([start_pose.r.x, start_pose.r.y, start_pose.r.z, start_pose.r.w], device=self.device)
@@ -279,7 +282,7 @@ class HumanoidSmall(VecTask):
             self.termination_height,
             self.death_cost,
             self.max_episode_length,
-            self.root_states
+            self.targets
         )
     def compute_observations(self):
         self.gym.refresh_dof_state_tensor(self.sim)
@@ -319,6 +322,12 @@ class HumanoidSmall(VecTask):
                                               gymtorch.unwrap_tensor(self.dof_state),
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
+        # reset the targets
+        new_targets = torch.zeros((len(env_ids), 3), device=self.device)
+        new_targets[:, 0] = torch.rand(len(env_ids), device=self.device) * 10 + 5     # X: 50 ~ 100
+        new_targets[:, 1] = torch.rand(len(env_ids), device=self.device) * 20 - 10
+        self.targets[env_ids] = new_targets
+
         to_target = self.targets[env_ids] - self.initial_root_states[env_ids, 0:3]
         to_target[:, self.up_axis_idx] = 0
         self.prev_potentials[env_ids] = -torch.norm(to_target, p=2, dim=-1) / self.dt
@@ -334,15 +343,15 @@ class HumanoidSmall(VecTask):
         # 定義每個維度對應的最小值與最大值
 
         min_vals = torch.tensor([
-            -0.2, -0.045, 0.15, -0.0349,   # 左腳: x, y, z, theta
-            -0.2, -0.045, 0.15, -0.0349,    # 右腳: x, y, z, theta
+            -0.2, -0.045, 0.15, -0.17453293,   # 左腳: x, y, z, theta
+            -0.2, -0.045, 0.15, -0.17453293,    # 右腳: x, y, z, theta
             -0.34906585, 0, 
             -0.34906585, -0.17453293       
         ], device=self.device)
 
         max_vals = torch.tensor([
-            0.2, 0.045, 0.235, 0.0349,
-            0.2, 0.045, 0.235, 0.0349,
+            0.2, 0.045, 0.235, 0.17453293,
+            0.2, 0.045, 0.235, 0.17453293,
             0.34906585,0.17453293,
             0.34906585,0
         ], device=self.device)
@@ -351,6 +360,31 @@ class HumanoidSmall(VecTask):
         foot_pos = (pos + 1) / 2 * (max_vals - min_vals) + min_vals
         # 換成公分
         self.foot_pos = foot_pos * 100
+
+    def calculate_walk(self):
+        walkdata_x = torch.ones((self.num_envs, 1), device=self.device)
+        walkdata_y = torch.ones((self.num_envs, 1), device=self.device)
+        walkdata_theta = torch.ones((self.num_envs, 1), device=self.device)
+
+        # === 新增: 計算與目標的距離與方向 ===
+        torso_pos = self.root_states[:, 0:3]
+        torso_rot = self.root_states[:, 3:7]
+        to_target = self.targets - torso_pos
+        to_target[:, 2] = 0
+
+        # 目標方向的角度
+        target_dir = torch.atan2(to_target[:, 1], to_target[:, 0])  # [Y / X]
+        # 機器人朝向的角度（從 torso_quat 計算）
+        yaw = self.obs_buf[:, 7]
+        # heading 誤差
+        heading_error = normalize_angle(target_dir - yaw)
+        
+        self.walkdata_x = torch.norm(to_target[:, :2], dim=1, keepdim=True)*walkdata_x  # 距離（X-Y 平面）
+        self.walkdata_y = walkdata_y
+        self.walkdata_theta = heading_error.unsqueeze(-1)*walkdata_theta  # yaw 誤差角度
+        # print("walkdata_x",self.walkdata_x[0])
+        # print("walkdata_theta",self.walkdata_theta[0])
+        self.walkinggait.readWalkData(self.walkdata_x, self.walkdata_y, self.walkdata_theta)
 
     def pre_physics_step(self, actions):
         self.actions = actions.to(self.device).clone()
@@ -371,46 +405,10 @@ class HumanoidSmall(VecTask):
         if len(env_ids) > 0:
             self.reset_idx(env_ids)
             self.walkinggait.reset(env_ids)
-
+        print("target",self.targets[0])
         self.compute_observations()
+        self.calculate_walk()
         self.compute_reward(self.actions)
-
-        # debug viz
-        # if self.viewer and self.debug_viz:
-        #     self.gym.clear_lines(self.viewer)
-
-        #     points = []
-        #     colors = []
-        #     for i in range(self.num_envs):
-        #         origin = self.gym.get_env_origin(self.envs[i])
-        #         torso_pos = self.root_states[i, 0:3].cpu().numpy()
-        #         torso_rot = self.root_states[i, 3:7].cpu()
-                
-        #         # === 頭部方向線 ===
-        #         heading = self.heading_vec[i].cpu().numpy()
-        #         up = self.up_vec[i].cpu().numpy()
-
-        #         start = torso_pos
-        #         end_heading = start + heading * 4
-        #         end_up = start + up * 4
-        #         points.append([*start, *end_heading])
-        #         colors.append([0.97, 0.1, 0.06])  # 紅
-        #         points.append([*start, *end_up])
-        #         colors.append([0.05, 0.99, 0.04])  # 綠
-
-        #         # === 左右腳目標線 ===
-        #         left_local = self.walkinggait.robot_state[i, 4:7].unsqueeze(0).cpu()
-        #         right_local = self.walkinggait.robot_state[i, 8:11].unsqueeze(0).cpu()
-                
-        #         left_world = (torso_pos + quat_rotate(torso_rot.unsqueeze(0), left_local)[0]).numpy()
-        #         right_world = (torso_pos + quat_rotate(torso_rot.unsqueeze(0), right_local)[0]).numpy()
-
-        #         points.append([*torso_pos, *left_world])
-        #         colors.append([0.0, 0.4, 1.0])  # 藍色：左腳目標
-        #         points.append([*torso_pos, *right_world])
-        #         colors.append([1.0, 0.6, 0.1])  # 橘色：右腳目標
-
-        #     self.gym.add_lines(self.viewer, None, len(points), points, colors)
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -569,13 +567,14 @@ def compute_humanoid_reward_v2(
     termination_height,
     death_cost,
     max_episode_length,
-    root_states
+    targets
 ):
     
     # === 各項獎勵 ===
-    heading_reward = torch.where(obs_buf[:, 11] > 0.8, 1.0, obs_buf[:, 11] / 0.8)
+    heading_reward = torch.where(obs_buf[:, 11] > 0.95, 1.0, obs_buf[:, 11] / 0.95)
     up_reward = torch.where(obs_buf[:, 10] > 0.93, 1.0, 0.0)
-
+    targets_yaw = torch.atan2(targets[:, 1], targets[:, 0])
+    yaw_reward = torch.where(torch.abs(obs_buf[:, 7] - targets_yaw) <0.087266463, 1.0, -0.1)
     com_error = torch.abs(obs_buf[:, 65] - robot_state[:, 2]) + torch.abs(obs_buf[:, 64] - robot_state[:, 3])
     com_reward = 1.0 - torch.tanh(2.0 * com_error)
 
@@ -589,12 +588,13 @@ def compute_humanoid_reward_v2(
     right_is_supporting = 1.0 - right_is_swinging
     robot_height = obs_buf[:, 0]
     robot_roll = obs_buf[:, 8]
+    robot_yaw = obs_buf[:, 7]
     #機器人高度penalty
-    print("robot_height",robot_height)
-    print("robot_roll",robot_roll)
+    # print("robot_height",robot_height)
+    # print("robot_roll",robot_roll)
     height_penalty = torch.where(torch.abs(robot_height-0.265)>0.005, -1.0, 0.0)
     robot_roll_penalty = torch.where(robot_roll > 0.02, -0.3, 0.1) * left_is_supporting + torch.where(robot_roll < -0.02, -0.3, 0.1) * right_is_supporting
-    print("robot_roll_penalty",robot_roll_penalty)
+    # print("robot_roll_penalty",robot_roll_penalty)
     # 機器人座標系中的左右腳目標位置
     left_target_x = robot_state[:, 4]/ 100
     right_target_x = robot_state[:, 8]/ 100
@@ -605,7 +605,7 @@ def compute_humanoid_reward_v2(
     right_actual_x = foot_end_point[:,3]
     left_actual_y = foot_end_point[:, 1]
     right_actual_y = foot_end_point[:, 4]
-
+    foot_diff = foot_end_point[:, 0:2] - foot_end_point[:, 3:5]
     # === Foot tracking reward（位置x誤差）===
     left_x_error = torch.abs(left_target_x - left_actual_x) * right_is_supporting
     right_x_error = torch.abs(right_target_x - right_actual_x) * left_is_supporting
@@ -642,48 +642,44 @@ def compute_humanoid_reward_v2(
     right_z_error = torch.abs(right_z_expected - right_z_actual) * left_is_supporting
     z_error = (left_z_error + right_z_error)*100
     foot_lift_reward = 0.5 - torch.tanh(3 * z_error)
-    print("left_z_error",left_z_error[0],"right_z_error",right_z_error[0])
-    print("left_z_expected",left_z_expected[0],"left_z_actual",left_z_actual[0])
-    print("right_z_expected",right_z_expected[0],"right_z_actual",right_z_actual[0])
+    # print("left_z_error",left_z_error[0],"right_z_error",right_z_error[0])
+    # print("left_z_expected",left_z_expected[0],"left_z_actual",left_z_actual[0])
+    # print("right_z_expected",right_z_expected[0],"right_z_actual",right_z_actual[0])
 
     # 身體的 yaw 偏移量懲罰
     yaw_penalty = torch.abs(obs_buf[:, 6])>0.17453293
     step_switch_reward = switch_foot.squeeze(-1).float()
     progress_reward = potentials - prev_potentials
     alive_reward = torch.ones_like(heading_reward) * 0.1
-
+    
     # === Reward 合併 ===
     total_reward = (
-        0.2 * heading_reward +
+        0.4 * heading_reward +
         0.2 * up_reward +
-        0.0 * com_reward +
-        0.15 * foot_tracking_x_penalty +
-        0.15 * foot_tracking_y_penalty +
-        0.3 * foot_lift_reward +
+        0.3 * yaw_reward +
+        0.5 * foot_tracking_x_penalty +
+        0.5 * foot_tracking_y_penalty +
+        0.5 * foot_lift_reward +
         0.5 * step_switch_reward +
-        0.5 * progress_reward +
+        0.3 * progress_reward +
         0.3 * height_penalty +
-        0.5 * robot_roll_penalty +
-        0.3 * hand_swing_reward +
+        0.8 * robot_roll_penalty +
+        0.5 * hand_swing_reward +
         alive_reward
     )
     # === 懲罰與重置條件 ===
+    foot_distance = torch.sqrt((foot_diff[:, 0] * foot_diff[:, 0] + foot_diff[:, 1] * foot_diff[:, 1]))*torch.cos(robot_yaw)
+    print("foot_distance",foot_distance[0])
     fallen = robot_height < termination_height
-    y_error = torch.abs(left_actual_y - right_actual_y) < 0.06
+    y_error = torch.abs(foot_distance) < 0.06
     total_reward = torch.where(fallen, torch.ones_like(total_reward) * death_cost, total_reward)
     total_reward = torch.where(y_error, torch.ones_like(total_reward) * death_cost, total_reward)
     total_reward = torch.where(yaw_penalty, torch.ones_like(total_reward) * death_cost, total_reward)
     reset = torch.where(obs_buf[:, 0] < termination_height, torch.ones_like(reset_buf), reset_buf)
-    # print("termination_height",reset[0])
     reset = torch.where(fallen, torch.ones_like(reset_buf), reset)
-    # print("fallen",reset[0])
-    # print("obs_buf[:, 64]",obs_buf[0, 68])
-    reset = torch.where(obs_buf[:, 68] > 0.03, torch.ones_like(reset_buf), torch.where(obs_buf[:,68]<-0.03,torch.ones_like(reset_buf),reset))
-    # print("aa",reset[0])
+    # reset = torch.where(obs_buf[:, 68] > 0.03, torch.ones_like(reset_buf), torch.where(obs_buf[:,68]<-0.03,torch.ones_like(reset_buf),reset))
     reset = torch.where(foot_x_error[:] > 10, torch.ones_like(reset_buf), reset)
-    # print("foot_x_error",reset[0])
     reset = torch.where(y_error, torch.ones_like(reset_buf), reset)
-    # print("y_error",reset[0])
     reset = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset)
     # === Debug print ===
     print("==== Debug Reward ====")
@@ -795,7 +791,8 @@ def compute_humanoid_observations_v2(
 
     torso_quat, up_proj, heading_proj, up_vec, heading_vec = compute_heading_and_up(
         torso_rotation, inv_start_rot, to_target, basis_vec0, basis_vec1, 2)
-
+    # print("torso_quat",torso_quat[0])
+    # print("heading_proj",heading_proj[0])
     vel_loc, angvel_loc, roll, pitch, yaw, angle_to_target = compute_rot(
         torso_quat, velocity, ang_velocity, targets, torso_position)
 

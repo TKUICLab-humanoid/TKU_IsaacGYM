@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from isaacgymenvs.utils.torch_jit_utils import to_torch
 
+DEGREES_TO_RADIANS =  180/torch.pi
+
 class WalkingGaitByLIPM:
     def __init__(self, _num_envs, _device,period_t_,T_DSP_,step_length_,lift_height_):
         self.device = _device
@@ -22,8 +24,9 @@ class WalkingGaitByLIPM:
         self.TT_ = torch.full((self.num_envs,1), period_t_ * 0.001, dtype=torch.float32, device=self.device)
         self.Tc_ = torch.full((self.num_envs,1),np.sqrt(27/9.8)/10, dtype=torch.float32, device=self.device)
         ###
-        self.step_length_ = step_length_
-        self.shift_length_ = 0
+        self.step_length_ = torch.zeros((self.num_envs, 1), device=self.device)
+        self.shift_length_ = torch.zeros((self.num_envs, 1), device=self.device)
+        self.turn_angle_ = torch.zeros((self.num_envs, 1), device=self.device)
         self.init()
 
     def init(self):
@@ -40,6 +43,7 @@ class WalkingGaitByLIPM:
         self.time_point_ = torch.zeros((self.num_envs, 1), device=self.device)
         self.t_ = torch.zeros((self.num_envs, 1), device=self.device)
         self.zero = torch.zeros((self.num_envs, 1), device=self.device)
+        self.one = torch.ones((self.num_envs, 1), device=self.device)
         #end point target
         self.now_x_l = torch.zeros((self.num_envs, 1), device=self.device)
         self.now_x_r = torch.zeros((self.num_envs, 1), device=self.device)
@@ -108,7 +112,7 @@ class WalkingGaitByLIPM:
         self.last_zmp_x[env_ids]          = 0
         self.zmp_y[env_ids]          = 0
         self.last_zmp_y[env_ids]          = 0
-        self.theta[env_ids]          = 0
+        # self.theta[env_ids]          = 0
         self.last_theta[env_ids]          = 0
         #COM parameter
         self.vx0[env_ids]    = 0
@@ -126,6 +130,14 @@ class WalkingGaitByLIPM:
         self.rpt[env_ids]    = 0
         self.switch_foot[env_ids] = 0
 
+    def readWalkData(self,x,y,theta):
+        self.step_length_ = torch.ones((self.num_envs, 1), device=self.device)*x
+        self.shift_length_ = torch.ones((self.num_envs, 1), device=self.device)*y
+        self.turn_angle_ = torch.ones((self.num_envs, 1), device=self.device)*theta
+        # print("step_length_",x)
+        # print("shift_length_",y)
+        # print("turn_angle_",theta)
+
     def process(self):
         self.sample_point_[:]  += 1
         self.time_point_[:] = self.sample_point_[:] * self.sample_time_
@@ -141,15 +153,8 @@ class WalkingGaitByLIPM:
         self.switch_foot_reward = self.switch_foot.clone()
         _env_ids = self.switch_foot.squeeze(-1)
         env_ids = _env_ids.nonzero(as_tuple=False).flatten()
-        # print("env_ids",env_ids)
         if len(env_ids) > 0:
             self.update_step(env_ids,self.walking_state)
-
-        # if stop:
-        #     self.step = self.now_step_+1
-
-        # self.robot_state[:] = self.walkinggait(self.walking_state)
-        # print("robot_state",self.robot_state)
         self.robot_state = self.coordinate_transformation(self.walkinggait(self.walking_state))
         return self.robot_state
 
@@ -179,14 +184,15 @@ class WalkingGaitByLIPM:
         self.last_displacement_y[env_ids] = self.displacement_y[env_ids]
         self.last_base_y[env_ids] = self.base_y[env_ids]
         self.last_theta[env_ids] = self.theta[env_ids]
-
         
 
+        self.theta[env_ids] = self.turn_angle_[env_ids] /DEGREES_TO_RADIANS
         self.now_width_[env_ids] = 2 * self.width_size_ * (-torch.pow(-torch.ones_like(self.now_step_[env_ids]), self.now_step_[env_ids] + 1))        
         # print("now_width_",self.now_width_)
-        self.displacement_x[env_ids] =  (self.step_length_ * torch.cos(self.theta[env_ids]) - self.shift_length_ * torch.sin(self.theta[env_ids])) - torch.sin(self.theta[env_ids]) * self.now_width_[env_ids]
-        self.displacement_y[env_ids] = (self.step_length_ * torch.sin(self.theta[env_ids]) + self.shift_length_ * torch.cos(self.theta[env_ids])) + torch.cos(self.theta[env_ids]) * self.now_width_[env_ids]
-        
+        self.displacement_x[env_ids] = (self.step_length_[env_ids] * torch.cos(self.theta[env_ids]) - self.shift_length_[env_ids] * torch.sin(self.theta[env_ids])) - torch.sin(self.theta[env_ids]) * self.now_width_[env_ids]
+        self.displacement_y[env_ids] = (self.step_length_[env_ids] * torch.sin(self.theta[env_ids]) + self.shift_length_[env_ids] * torch.cos(self.theta[env_ids])) + torch.cos(self.theta[env_ids]) * self.now_width_[env_ids]
+        # print("displacement_x",self.displacement_x)
+        # print("displacement_y",self.displacement_y)
         # 找出哪些 env_ids 需要 displacement_x/y (walking_state > 1)
         mask = walking_state[env_ids] > 1
         mask = mask.flatten()
@@ -266,7 +272,7 @@ class WalkingGaitByLIPM:
         return robot_state[stop_ids]
 
     def start_step(self, robot_state, start_ids):
-        # print("start")
+        print("start")
         self.vx0[start_ids] = self.wComVelocityInit(self.zero[start_ids], self.zero[start_ids], self.zmp_x[start_ids], self.TT_[start_ids], self.Tc_[start_ids])
         self.vy0[start_ids] = self.wComVelocityInit(self.zero[start_ids], self.zero[start_ids], self.zmp_y[start_ids], self.TT_[start_ids], self.Tc_[start_ids])
         self.px[start_ids] = self.wComPosition(self.zero[start_ids], self.vx0[start_ids], self.zmp_x[start_ids], self.t_[start_ids], self.Tc_[start_ids])
@@ -278,7 +284,7 @@ class WalkingGaitByLIPM:
         swing_lpx = self.wFootPositionRepeat(self.now_x_l[start_ids], self.zero[start_ids], self.t_[start_ids], self.TT_[start_ids], self.t_DSP_)
         swing_lpy = self.wFootPositionRepeat(self.now_y_l[start_ids], self.zero[start_ids], self.t_[start_ids], self.TT_[start_ids], self.t_DSP_)
         swing_lpz = self.wFootPositionZ(self.lift_height_, self.t_[start_ids], self.TT_[start_ids], self.t_DSP_)
-
+        
         swing_rpx = self.wFootPositionRepeat(self.now_x_r[start_ids], self.zero[start_ids], self.t_[start_ids], self.TT_[start_ids], self.t_DSP_)
         swing_rpy = self.wFootPositionRepeat(self.now_y_r[start_ids], self.zero[start_ids], self.t_[start_ids], self.TT_[start_ids], self.t_DSP_)
         swing_rpz = self.wFootPositionZ(self.lift_height_, self.t_[start_ids], self.TT_[start_ids], self.t_DSP_)
@@ -304,7 +310,7 @@ class WalkingGaitByLIPM:
         return robot_state[start_ids]
    
     def first_step(self,robot_state,first_ids):
-        # print("first")
+        print("first")
         self.vx0[first_ids] = self.wComVelocityInit(self.zero[first_ids], self.base_x[first_ids], self.zmp_x[first_ids], self.TT_[first_ids], self.Tc_[first_ids])
         self.vy0[first_ids] = self.wComVelocityInit(self.zero[first_ids], self.base_y[first_ids], self.zmp_y[first_ids], self.TT_[first_ids], self.Tc_[first_ids])
         self.px[first_ids] = self.wComPosition(self.zero[first_ids], self.vx0[first_ids], self.zmp_x[first_ids], self.t_[first_ids], self.Tc_[first_ids])
@@ -313,12 +319,12 @@ class WalkingGaitByLIPM:
         self.lpx[first_ids] = self.wFootPosition(self.now_x_l[first_ids], self.displacement_x[first_ids], self.t_[first_ids], self.TT_[first_ids], self.t_DSP_)
         self.lpy[first_ids] = self.wFootPosition(self.now_y_l[first_ids], self.displacement_y[first_ids] - self.now_width_[first_ids], self.t_[first_ids], self.TT_[first_ids], self.t_DSP_)
         self.lpz[first_ids] = self.wFootPositionZ(self.lift_height_, self.t_[first_ids], self.TT_[first_ids], self.t_DSP_)
-        self.lpt[first_ids] = 0
+        self.lpt[first_ids] = self.wFootTheta(-self.last_theta[first_ids],self.one[first_ids], self.t_[first_ids], self.TT_[first_ids], self.t_DSP_)
 
         self.rpx[first_ids] = self.zmp_x[first_ids]
         self.rpy[first_ids] = self.zmp_y[first_ids]
         self.rpz[first_ids] = 0.0
-        self.rpt[first_ids] = 0
+        self.rpt[first_ids] = self.wFootTheta(-self.theta[first_ids],self.zero[first_ids], self.t_[first_ids], self.TT_[first_ids], self.t_DSP_)
 
         robot_state[first_ids] = torch.cat([
             self.vx0[first_ids], self.vy0[first_ids],
@@ -329,7 +335,7 @@ class WalkingGaitByLIPM:
         return robot_state[first_ids]
     
     def repeat_step(self, robot_state, repeat_ids):
-        # print("repeat")
+        print("repeat")
         # COM 計算
         self.vx0[repeat_ids] = self.wComVelocityInit(
             self.last_base_x[repeat_ids], self.base_x[repeat_ids],
@@ -364,17 +370,21 @@ class WalkingGaitByLIPM:
         swing_rpy = self.wFootPositionRepeat(self.now_y_r[repeat_ids], dy, self.t_[repeat_ids], self.TT_[repeat_ids], self.t_DSP_)
         swing_rpz = self.wFootPositionZ(self.lift_height_, self.t_[repeat_ids], self.TT_[repeat_ids], self.t_DSP_)
 
+        last_pt = self.wFootTheta(-self.last_theta[repeat_ids], self.one[repeat_ids], self.t_[repeat_ids], self.TT_[repeat_ids], self.t_DSP_)
+        now_pt = self.wFootTheta(-self.theta[repeat_ids], self.zero[repeat_ids], self.t_[repeat_ids], self.TT_[repeat_ids], self.t_DSP_)
+        now_pt = torch.where(now_pt*last_pt < 0, 0, now_pt)
+
         # 設定 foot pos：左腳
         self.lpx[repeat_ids] = torch.where(is_left_swinging, swing_lpx, self.zmp_x[repeat_ids])
         self.lpy[repeat_ids] = torch.where(is_left_swinging, swing_lpy, self.zmp_y[repeat_ids])
         self.lpz[repeat_ids] = torch.where(is_left_swinging, swing_lpz, torch.zeros_like(swing_lpz))
-        self.lpt[repeat_ids] = 0
+        self.lpt[repeat_ids] = torch.where(is_left_swinging, last_pt, now_pt)
 
         # 右腳
         self.rpx[repeat_ids] = torch.where(is_left_swinging, self.zmp_x[repeat_ids], swing_rpx)
         self.rpy[repeat_ids] = torch.where(is_left_swinging, self.zmp_y[repeat_ids], swing_rpy)
         self.rpz[repeat_ids] = torch.where(is_left_swinging, torch.zeros_like(swing_rpz), swing_rpz)
-        self.rpt[repeat_ids] = 0
+        self.rpt[repeat_ids] = torch.where(is_left_swinging, now_pt, last_pt)
 
         # 最後組成 robot_state
         robot_state[repeat_ids] = torch.cat([
@@ -385,7 +395,6 @@ class WalkingGaitByLIPM:
         ], dim=1)
 
         return robot_state[repeat_ids]
-
 
     def coordinate_transformation(self, robot_state):
         """批量座標變換 W to B"""
@@ -490,6 +499,8 @@ class WalkingGaitByLIPM:
         return torch.where(cond, z, torch.zeros_like(z))
 
     def wFootTheta(self, theta, reverse, t, T, T_DSP):
+        reverse = reverse.bool()
+
         new_T = T * (1 - T_DSP)
         new_t = t - T * T_DSP / 2
         PI = torch.ones_like(new_t) * np.pi
@@ -501,24 +512,42 @@ class WalkingGaitByLIPM:
         cond3 = ~(cond1 | cond2)  # 其他
 
         # 如果 reverse = True
-        rev_true_mid = 0.5 * theta * (1 - torch.cos(0.5 * omega * (new_t - new_T)))
-        rev_true_last = torch.zeros_like(theta)
-        rev_true_first = theta
+        # rev_true_mid = 0.5 * theta * (1 - torch.cos(0.5 * omega * (new_t - new_T)))
+        # rev_true_last = torch.zeros_like(theta)
+        # rev_true_first = theta
 
-        # 如果 reverse = False
-        rev_false_mid = 0.5 * theta * (1 - torch.cos(0.5 * omega * new_t))
-        rev_false_first = torch.zeros_like(theta)
-        rev_false_last = theta
+        # # 如果 reverse = False
+        # rev_false_mid = 0.5 * theta * (1 - torch.cos(0.5 * omega * new_t))
+        # rev_false_first = torch.zeros_like(theta)
+        # rev_false_last = theta
 
-        # 最終輸出（根據 reverse 選擇對應邏輯）
-        out = torch.where(
-            cond1,
-            torch.where(reverse, rev_true_first, rev_false_first),
-            torch.where(
-                cond2,
-                torch.where(reverse, rev_true_mid, rev_false_mid),
-                torch.where(reverse, rev_true_last, rev_false_last)
-            )
+        # # 最終輸出（根據 reverse 選擇對應邏輯）
+        # out = torch.where(
+        #     cond1,
+        #     torch.where(reverse, rev_true_first, rev_false_first),
+        #     torch.where(
+        #         cond2,
+        #         torch.where(reverse, rev_true_mid, rev_false_mid),
+        #         torch.where(reverse, rev_true_last, rev_false_last)
+        #     )
+        # )
+        mid_theta = torch.where(
+            reverse,
+            0.5 * theta * (1 - torch.cos(0.5 * omega * (new_t - new_T))),
+            0.5 * theta * (1 - torch.cos(0.5 * omega * new_t))
         )
 
-        return out
+        first_theta = torch.where(reverse, theta, torch.zeros_like(theta))
+        last_theta = torch.where(reverse, torch.zeros_like(theta), theta)
+
+        # 組合三段邏輯
+        result = torch.where(
+            cond1,
+            first_theta,
+            torch.where(
+                cond2,
+                mid_theta,
+                last_theta
+            )
+        )
+        return result
