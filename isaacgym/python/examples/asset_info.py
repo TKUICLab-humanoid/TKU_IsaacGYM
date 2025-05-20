@@ -18,7 +18,7 @@ Demonstrates introspection capabilities of the gym api at the asset and environm
 import os
 from isaacgym import gymapi
 from isaacgym import gymutil
- 
+
 
 def print_asset_info(asset, name):
     print("======== Asset info %s: ========" % (name))
